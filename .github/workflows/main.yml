@@ -38,6 +38,20 @@ jobs:
 
           # Speed: Defender real-time scan off
           Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+
+          # Lag fix: lighter RDP graphics (16-bit colour, no wallpaper, UDP+TCP)
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $ts -Force | Out-Null
+          Set-ItemProperty -Path $ts -Name ColorDepth -Value 3 -Type DWord
+          Set-ItemProperty -Path $ts -Name fNoRemoteDesktopWallpaper -Value 1 -Type DWord
+          Set-ItemProperty -Path $ts -Name fClientDisableUDP -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts -Name SelectTransport -Value 0 -Type DWord
+
+          # Lag fix: stop heavy background services
+          foreach ($svc in 'wuauserv','WSearch','DiagTrack','SysMain') {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
           Write-Host "RDP enabled"
 
       - name: Create RDP user
@@ -87,4 +101,3 @@ jobs:
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP active"
             Start-Sleep -Seconds 300
           }
-          
