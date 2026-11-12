@@ -1,0 +1,90 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    # Free Windows Server 2025 runner. For a paid fast runner, change to: win-fast
+    runs-on: windows-2025
+    timeout-minutes: 360
+
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+    steps:
+      - name: Check secrets
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY2 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Secret RDP_PASSWORD is missing" }
+          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) { throw "Secret TAILSCALE_AUTH_KEY2 is missing" }
+          Write-Host "Secrets OK"
+
+      - name: Enable RDP and speed tweaks
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+          # Speed: High Performance power plan, no sleep
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+
+          # Speed: Defender real-time scan off
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Write-Host "RDP enabled"
+
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+            New-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          Write-Host "User RDP ready"
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY2 }}
+          hostname: gh-rdp-${{ github.run_id }}
+          use-cache: 'true'
+
+      - name: Show address and keep alive
+        shell: pwsh
+        run: |
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) { $exe = (Get-Command tailscale -ErrorAction Stop).Source }
+
+          $ip = $null
+          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
+            $ip = (& $exe ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) { Start-Sleep -Seconds 3 }
+          }
+          if (-not $ip) { throw "Tailscale IP not available" }
+
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "ADDRESS : $ip"
+          Write-Host "USERNAME: RDP"
+          Write-Host "PASSWORD: value of RDP_PASSWORD secret"
+          Write-Host "=============================="
+          Write-Host ""
+
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP active"
+            Start-Sleep -Seconds 300
+          }
+          
