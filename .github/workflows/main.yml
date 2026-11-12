@@ -2,11 +2,16 @@ name: RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner: windows-2025 (free) or win-fast (paid larger runner)"
+        default: "windows-2025"
+        required: true
 
 jobs:
   rdp:
     # Free Windows Server 2025 runner. For a paid fast runner, change to: win-fast
-    runs-on: windows-2025
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
 
     env:
@@ -52,6 +57,26 @@ jobs:
             Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
           }
+
+          # Turbo: CPU priority to foreground programs (Programs, not Background services)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' -Name Win32PrioritySeparation -Value 38 -Type DWord
+
+          # Turbo: no animations or transparency for every new user (applies to RDP user at first login)
+          try {
+            reg load HKU\TmpDefault "C:\Users\Default\NTUSER.DAT" | Out-Null
+            reg add "HKU\TmpDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+            reg add "HKU\TmpDefault\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null
+            reg add "HKU\TmpDefault\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
+            reg add "HKU\TmpDefault\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
+            reg add "HKU\TmpDefault\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+            reg add "HKU\TmpDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f | Out-Null
+            [gc]::Collect()
+            Start-Sleep -Seconds 2
+            reg unload HKU\TmpDefault | Out-Null
+          } catch { Write-Host "Visual tweaks skipped: $_" }
+
+          # Turbo: show full details quickly, no Server Manager popup at login
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name DoNotOpenServerManagerAtLogon -Value 1 -Type DWord -ErrorAction SilentlyContinue
           Write-Host "RDP enabled"
 
       - name: Create RDP user
