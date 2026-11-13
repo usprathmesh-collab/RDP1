@@ -1,4 +1,4 @@
-name: RDP Turbo 2
+name: RDP Best
 
 on:
   workflow_dispatch:
@@ -101,6 +101,9 @@ jobs:
           Set-MpPreference -DisableIOAVProtection $true -DisableBehaviorMonitoring $true -DisableScriptScanning $true -MAPSReporting 0 -ErrorAction SilentlyContinue
           Add-MpPreference -ExclusionPath 'C:\','D:\' -ErrorAction SilentlyContinue
           Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -like '\Microsoft\Windows\UpdateOrchestrator\*' -or $_.TaskPath -like '\Microsoft\Windows\Windows Defender\*' -or $_.TaskPath -like '\Microsoft\Windows\Defrag\*' -or $_.TaskPath -like '\Microsoft\Windows\WindowsUpdate\*' } | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+
+          # Smoothness: 60 fps remote screen updates (default is 30)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations' -Name DWMFRAMEINTERVAL -Value 15 -Type DWord
           Write-Host "RDP enabled"
 
       - name: Create RDP user
