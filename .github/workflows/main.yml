@@ -1,8 +1,15 @@
 
-name: RDP Ultra Performance
+name: RDP Turbo Free
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdp-turbo
+  cancel-in-progress: true
 
 jobs:
   rdp:
@@ -13,46 +20,73 @@ jobs:
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
     steps:
-      - name: Check Secrets
+      - name: Validate Secrets
         shell: pwsh
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY2 }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "RDP_PASSWORD missing" }
-          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) { throw "TAILSCALE_AUTH_KEY2 missing" }
+          if (!$env:RDP_PASSWORD) { throw "RDP_PASSWORD missing" }
+          if (!$env:TS_KEY) { throw "TAILSCALE_AUTH_KEY2 missing" }
+          Write-Host "Secrets verified"
 
-      - name: Configure RDP
+      - name: Windows Performance Setup
         shell: pwsh
         run: |
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          # Enable RDP
+          Set-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+
           Set-Service TermService -StartupType Automatic
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
 
+          # High performance power
           powercfg /setactive SCHEME_MIN
           powercfg /change monitor-timeout-ac 0
           powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
 
-          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-          New-Item -Path $ts -Force | Out-Null
-          Set-ItemProperty $ts -Name ColorDepth -Value 3 -Type DWord
-          Set-ItemProperty $ts -Name fNoRemoteDesktopWallpaper -Value 1 -Type DWord
+          # RDP low bandwidth graphics
+          $path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $path -Force | Out-Null
 
-          Write-Host "RDP optimized"
-
-      - name: Create RDP User
-        shell: pwsh
-        run: |
-          $pass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-
-          if (Get-LocalUser RDP -ErrorAction SilentlyContinue) {
-            Set-LocalUser RDP -Password $pass
-          } else {
-            New-LocalUser RDP -Password $pass -PasswordNeverExpires | Out-Null
+          $settings = @{
+            ColorDepth = 3
+            fNoRemoteDesktopWallpaper = 1
+            fDisableWallpaper = 1
+            fDisableFullWindowDrag = 1
+            fDisableMenuAnims = 1
+            fDisableThemes = 1
           }
 
-          Add-LocalGroupMember Administrators RDP -ErrorAction SilentlyContinue
-          Add-LocalGroupMember "Remote Desktop Users" RDP -ErrorAction SilentlyContinue
+          foreach ($key in $settings.Keys) {
+            New-ItemProperty -Path $path -Name $key `
+              -Value $settings[$key] -PropertyType DWord -Force | Out-Null
+          }
+
+          # Do not disable Defender or Windows Update
+          Write-Host "Performance setup complete"
+
+      - name: Create RDP Account
+        shell: pwsh
+        run: |
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name RDP -Password $secure
+          } else {
+            New-LocalUser -Name RDP -Password $secure `
+              -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" `
+            -Member RDP -ErrorAction SilentlyContinue
+
+          Write-Host "RDP account ready"
 
       - name: Connect Tailscale
         uses: tailscale/github-action@v3
@@ -61,46 +95,72 @@ jobs:
           hostname: gh-rdp-${{ github.run_id }}
           use-cache: 'true'
 
-      - name: Start RDP Monitor
+      - name: RDP Turbo Monitor
         shell: pwsh
         run: |
           $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $exe)) {
+
+          if (!(Test-Path $exe)) {
             $exe = (Get-Command tailscale -ErrorAction Stop).Source
           }
 
           $ip = $null
-          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
+
+          for ($i = 0; $i -lt 30 -and !$ip; $i++) {
             $ip = (& $exe ip -4 2>$null | Select-Object -First 1)
-            if (-not $ip) { Start-Sleep 3 }
+            if (!$ip) { Start-Sleep 2 }
           }
 
-          if (-not $ip) { throw "Tailscale IP unavailable" }
+          if (!$ip) { throw "Tailscale IP unavailable" }
 
-          Write-Host "ADDRESS: $ip"
-          Write-Host "USERNAME: RDP"
-          Write-Host "PASSWORD: RDP_PASSWORD secret"
+          Write-Host "================================"
+          Write-Host "RDP ADDRESS : $ip"
+          Write-Host "USERNAME    : RDP"
+          Write-Host "PASSWORD    : RDP_PASSWORD secret"
+          Write-Host "================================"
+
+          $counter = 0
 
           while ($true) {
-            Get-Process terminal64,terminal -ErrorAction SilentlyContinue |
+
+            # Give MT5 slightly higher CPU scheduling priority
+            Get-Process -Name terminal64,terminal -ErrorAction SilentlyContinue |
               ForEach-Object {
                 try { $_.PriorityClass = 'AboveNormal' } catch {}
               }
 
-            Get-Process msedge,chrome -ErrorAction SilentlyContinue |
-              ForEach-Object {
-                try { $_.PriorityClass = 'Normal' } catch {}
-              }
+            $counter++
 
-            $os = Get-CimInstance Win32_OperatingSystem
-            $cpu = Get-CimInstance Win32_Processor |
-              Measure-Object LoadPercentage -Average
+            if ($counter -ge 5) {
+              $counter = 0
 
-            $total = $os.TotalVisibleMemorySize
-            $free = $os.FreePhysicalMemory
-            $ram = [math]::Round((1 - $free / $total) * 100, 1)
+              $os = Get-CimInstance Win32_OperatingSystem
+              $cpu = Get-CimInstance Win32_Processor |
+                Measure-Object LoadPercentage -Average
 
-            Write-Host "CPU: $($cpu.Average)% | RAM: $ram%"
+              $total = $os.TotalVisibleMemorySize
+              $free = $os.FreePhysicalMemory
+              $used = [math]::Round((1 - $free / $total) * 100, 1)
+
+              $disk = Get-CimInstance Win32_LogicalDisk `
+                -Filter "DeviceID='C:'"
+
+              Write-Host "===== PERFORMANCE REPORT ====="
+              Write-Host "CPU LOAD: $($cpu.Average)%"
+              Write-Host "RAM USED: $used%"
+              Write-Host "FREE RAM: $([math]::Round($free / 1MB, 2)) GB"
+              Write-Host "FREE SSD: $([math]::Round($disk.FreeSpace / 1GB, 2)) GB"
+
+              Get-Process |
+                Sort-Object WorkingSet64 -Descending |
+                Select-Object -First 5 ProcessName,
+                  @{N='RAM_MB';E={[math]::Round($_.WorkingSet64 / 1MB)}} |
+                Format-Table -AutoSize |
+                Out-String |
+                Write-Host
+
+              Write-Host "=============================="
+            }
 
             Start-Sleep -Seconds 60
           }
