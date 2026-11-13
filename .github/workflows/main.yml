@@ -1,92 +1,122 @@
-
-name: RDP Turbo Free
+name: RDP Turbo 2
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: rdp-turbo
-  cancel-in-progress: true
+    inputs:
+      runner:
+        description: "Runner: windows-2025 (free) or win-fast (paid larger runner)"
+        default: "windows-2025"
+        required: true
 
 jobs:
   rdp:
-    runs-on: windows-2025
+    # Free Windows Server 2025 runner. For a paid fast runner, change to: win-fast
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
 
     env:
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
     steps:
-      - name: Validate Secrets
+      - name: Check secrets
         shell: pwsh
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY2 }}
         run: |
-          if (!$env:RDP_PASSWORD) { throw "RDP_PASSWORD missing" }
-          if (!$env:TS_KEY) { throw "TAILSCALE_AUTH_KEY2 missing" }
-          Write-Host "Secrets verified"
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Secret RDP_PASSWORD is missing" }
+          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) { throw "Secret TAILSCALE_AUTH_KEY2 is missing" }
+          Write-Host "Secrets OK"
 
-      - name: Windows Performance Setup
+      - name: Enable RDP and speed tweaks
         shell: pwsh
         run: |
-          # Enable RDP
-          Set-ItemProperty `
-            'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
-
-          Set-ItemProperty `
-            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1
-
-          Set-Service TermService -StartupType Automatic
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
 
-          # High performance power
-          powercfg /setactive SCHEME_MIN
+          # Speed: High Performance power plan, no sleep
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
           powercfg /change monitor-timeout-ac 0
           powercfg /change standby-timeout-ac 0
-          powercfg /change hibernate-timeout-ac 0
 
-          # RDP low bandwidth graphics
-          $path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-          New-Item -Path $path -Force | Out-Null
+          # Speed: Defender real-time scan off
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
 
-          $settings = @{
-            ColorDepth = 3
-            fNoRemoteDesktopWallpaper = 1
-            fDisableWallpaper = 1
-            fDisableFullWindowDrag = 1
-            fDisableMenuAnims = 1
-            fDisableThemes = 1
+          # Lag fix: lighter RDP graphics (16-bit colour, no wallpaper, UDP+TCP)
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $ts -Force | Out-Null
+          Set-ItemProperty -Path $ts -Name ColorDepth -Value 3 -Type DWord
+          Set-ItemProperty -Path $ts -Name fNoRemoteDesktopWallpaper -Value 1 -Type DWord
+          Set-ItemProperty -Path $ts -Name fClientDisableUDP -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts -Name SelectTransport -Value 0 -Type DWord
+
+          # Lag fix: stop heavy background services
+          foreach ($svc in 'wuauserv','WSearch','DiagTrack','SysMain') {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
           }
 
-          foreach ($key in $settings.Keys) {
-            New-ItemProperty -Path $path -Name $key `
-              -Value $settings[$key] -PropertyType DWord -Force | Out-Null
+          # Turbo: CPU priority to foreground programs (Programs, not Background services)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' -Name Win32PrioritySeparation -Value 38 -Type DWord
+
+          # Turbo: no animations or transparency for every new user (applies to RDP user at first login)
+          try {
+            reg load HKU\TmpDefault "C:\Users\Default\NTUSER.DAT" | Out-Null
+            reg add "HKU\TmpDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+            reg add "HKU\TmpDefault\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null
+            reg add "HKU\TmpDefault\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
+            reg add "HKU\TmpDefault\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
+            reg add "HKU\TmpDefault\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+            reg add "HKU\TmpDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f | Out-Null
+            [gc]::Collect()
+            Start-Sleep -Seconds 2
+            reg unload HKU\TmpDefault | Out-Null
+          } catch { Write-Host "Visual tweaks skipped: $_" }
+
+          # Turbo: show full details quickly, no Server Manager popup at login
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name DoNotOpenServerManagerAtLogon -Value 1 -Type DWord -ErrorAction SilentlyContinue
+
+          # Turbo2: temp files and browser caches on the fast D: drive
+          New-Item -ItemType Directory -Path 'D:\Temp','D:\ChromeCache','D:\EdgeCache' -Force | Out-Null
+          icacls 'D:\Temp' /grant 'Everyone:(OI)(CI)F' | Out-Null
+          icacls 'D:\ChromeCache' /grant 'Everyone:(OI)(CI)F' | Out-Null
+          icacls 'D:\EdgeCache' /grant 'Everyone:(OI)(CI)F' | Out-Null
+          [Environment]::SetEnvironmentVariable('TEMP', 'D:\Temp', 'Machine')
+          [Environment]::SetEnvironmentVariable('TMP', 'D:\Temp', 'Machine')
+          foreach ($p in @(
+            @('HKLM:\SOFTWARE\Policies\Google\Chrome', 'D:\ChromeCache'),
+            @('HKLM:\SOFTWARE\Policies\Microsoft\Edge', 'D:\EdgeCache'))) {
+            New-Item -Path $p[0] -Force | Out-Null
+            Set-ItemProperty -Path $p[0] -Name DiskCacheDir -Value $p[1] -Type String
+            Set-ItemProperty -Path $p[0] -Name BackgroundModeEnabled -Value 0 -Type DWord
           }
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name StartupBoostEnabled -Value 0 -Type DWord
 
-          # Do not disable Defender or Windows Update
-          Write-Host "Performance setup complete"
+          # Turbo2: no SmartScreen checks, lighter Defender, no heavy scheduled tasks
+          $sys = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+          New-Item -Path $sys -Force | Out-Null
+          Set-ItemProperty -Path $sys -Name EnableSmartScreen -Value 0 -Type DWord
+          Set-MpPreference -DisableIOAVProtection $true -DisableBehaviorMonitoring $true -DisableScriptScanning $true -MAPSReporting 0 -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath 'C:\','D:\' -ErrorAction SilentlyContinue
+          Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -like '\Microsoft\Windows\UpdateOrchestrator\*' -or $_.TaskPath -like '\Microsoft\Windows\Windows Defender\*' -or $_.TaskPath -like '\Microsoft\Windows\Defrag\*' -or $_.TaskPath -like '\Microsoft\Windows\WindowsUpdate\*' } | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+          Write-Host "RDP enabled"
 
-      - name: Create RDP Account
+      - name: Create RDP user
         shell: pwsh
         run: |
-          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
 
-          if (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name RDP -Password $secure
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "RDP" -Password $securePass
           } else {
-            New-LocalUser -Name RDP -Password $secure `
-              -PasswordNeverExpires -AccountNeverExpires | Out-Null
+            New-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires -AccountNeverExpires | Out-Null
           }
 
-          Add-LocalGroupMember -Group "Remote Desktop Users" `
-            -Member RDP -ErrorAction SilentlyContinue
-
-          Write-Host "RDP account ready"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          Write-Host "User RDP ready"
 
       - name: Connect Tailscale
         uses: tailscale/github-action@v3
@@ -95,72 +125,28 @@ jobs:
           hostname: gh-rdp-${{ github.run_id }}
           use-cache: 'true'
 
-      - name: RDP Turbo Monitor
+      - name: Show address and keep alive
         shell: pwsh
         run: |
           $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (!(Test-Path $exe)) {
-            $exe = (Get-Command tailscale -ErrorAction Stop).Source
-          }
+          if (-not (Test-Path $exe)) { $exe = (Get-Command tailscale -ErrorAction Stop).Source }
 
           $ip = $null
-
-          for ($i = 0; $i -lt 30 -and !$ip; $i++) {
+          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
             $ip = (& $exe ip -4 2>$null | Select-Object -First 1)
-            if (!$ip) { Start-Sleep 2 }
+            if (-not $ip) { Start-Sleep -Seconds 3 }
           }
+          if (-not $ip) { throw "Tailscale IP not available" }
 
-          if (!$ip) { throw "Tailscale IP unavailable" }
-
-          Write-Host "================================"
-          Write-Host "RDP ADDRESS : $ip"
-          Write-Host "USERNAME    : RDP"
-          Write-Host "PASSWORD    : RDP_PASSWORD secret"
-          Write-Host "================================"
-
-          $counter = 0
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "ADDRESS : $ip"
+          Write-Host "USERNAME: RDP"
+          Write-Host "PASSWORD: value of RDP_PASSWORD secret"
+          Write-Host "=============================="
+          Write-Host ""
 
           while ($true) {
-
-            # Give MT5 slightly higher CPU scheduling priority
-            Get-Process -Name terminal64,terminal -ErrorAction SilentlyContinue |
-              ForEach-Object {
-                try { $_.PriorityClass = 'AboveNormal' } catch {}
-              }
-
-            $counter++
-
-            if ($counter -ge 5) {
-              $counter = 0
-
-              $os = Get-CimInstance Win32_OperatingSystem
-              $cpu = Get-CimInstance Win32_Processor |
-                Measure-Object LoadPercentage -Average
-
-              $total = $os.TotalVisibleMemorySize
-              $free = $os.FreePhysicalMemory
-              $used = [math]::Round((1 - $free / $total) * 100, 1)
-
-              $disk = Get-CimInstance Win32_LogicalDisk `
-                -Filter "DeviceID='C:'"
-
-              Write-Host "===== PERFORMANCE REPORT ====="
-              Write-Host "CPU LOAD: $($cpu.Average)%"
-              Write-Host "RAM USED: $used%"
-              Write-Host "FREE RAM: $([math]::Round($free / 1MB, 2)) GB"
-              Write-Host "FREE SSD: $([math]::Round($disk.FreeSpace / 1GB, 2)) GB"
-
-              Get-Process |
-                Sort-Object WorkingSet64 -Descending |
-                Select-Object -First 5 ProcessName,
-                  @{N='RAM_MB';E={[math]::Round($_.WorkingSet64 / 1MB)}} |
-                Format-Table -AutoSize |
-                Out-String |
-                Write-Host
-
-              Write-Host "=============================="
-            }
-
-            Start-Sleep -Seconds 60
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP active"
+            Start-Sleep -Seconds 300
           }
